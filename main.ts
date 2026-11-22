@@ -1,29 +1,16 @@
-// Tiny stack VM: a faithful interpreter of make.fun's tiny stack ISA v1
-// (kit: generator/subject/ISA.md). For every /input/<id>/ program it writes
-// /output/<id>/stdout.bin (exactly the bytes the program wrote) and
-// /output/<id>/exit.txt (its exit code). Node 22, no dependencies.
+// Tiny stack VM: a faithful interpreter of make.fun's tiny stack ISA v1.
+// For every /input/<id>/ program writes /output/<id>/stdout.bin + exit.txt.
+// Node 22, no dependencies.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-// [opcode, pops, pushes, immediate bytes] for every valid opcode.
-const SPEC = [
-  [0x00, 0, 0, 0], [0x01, 0, 1, 1], [0x02, 0, 1, 4], [0x03, 1, 0, 0],
-  [0x04, 1, 2, 0], [0x05, 2, 2, 0], [0x06, 2, 3, 0], [0x07, 3, 3, 0],
-  [0x10, 2, 1, 0], [0x11, 2, 1, 0], [0x12, 2, 1, 0], [0x13, 2, 1, 0],
-  [0x14, 2, 1, 0], [0x15, 2, 1, 0], [0x16, 2, 1, 0], [0x17, 1, 1, 0],
-  [0x18, 2, 1, 0], [0x19, 2, 1, 0], [0x1a, 2, 1, 0], [0x1b, 1, 1, 0],
-  [0x1c, 2, 1, 0], [0x1d, 2, 1, 0], [0x1e, 2, 1, 0], [0x20, 2, 1, 0],
-  [0x21, 2, 1, 0], [0x22, 2, 1, 0], [0x30, 0, 0, 2], [0x31, 1, 0, 2],
-  [0x32, 1, 0, 2], [0x33, 0, 0, 2], [0x34, 0, 0, 0], [0x40, 1, 1, 0],
-  [0x41, 2, 0, 0], [0x50, 1, 0, 0], [0x51, 1, 0, 0], [0x52, 0, 1, 0],
-  [0x53, 1, 0, 0],
-];
-const OK = new Uint8Array(256), PO = new Uint8Array(256), PU = new Uint8Array(256), IM = new Uint8Array(256);
-for (const [o, a, b, c] of SPEC) { OK[o] = 1; PO[o] = a; PU[o] = b; IM[o] = c; }
+// Per-opcode shape from the byte (pops, pushes, immediate bytes).
+const valid = (o) => o < 8 || (o > 15 && o < 35) || (o > 47 && o < 53) || o === 64 || o === 65 || (o > 79 && o < 84);
+const pops = (o) => o === 7 ? 3 : (o === 5 || o === 6 || (o >= 16 && o <= 22) || (o >= 24 && o <= 26) || (o >= 28 && o <= 30) || (o >= 32 && o <= 34) || o === 65) ? 2 : (o < 3 || o === 48 || o === 51 || o === 52 || o === 82) ? 0 : 1;
+const pushes = (o) => (o === 4 || o === 5) ? 2 : (o === 6 || o === 7) ? 3 : (o === 1 || o === 2 || o === 82 || (o >= 16 && o <= 34) || o === 64) ? 1 : 0;
+const imm = (o) => o === 1 ? 1 : o === 2 ? 4 : (o >= 48 && o <= 51) ? 2 : 0;
 
-const enc = new TextEncoder();
-
-// Runs one program on its input bytes; returns [stdout bytes, exit code].
+const tmp = new Uint8Array(12); // scratch for PRINT's decimal digits
 // Traps end the run at once with the trap's code, keeping prior output.
 function run(p, inp) {
   const n = p.length;
@@ -34,13 +21,14 @@ function run(p, inp) {
     if (st === 1000000) return [out.subarray(0, ol), 10];
     if (pc < 0 || pc >= n) return [out.subarray(0, ol), 9];
     const o = p[pc];
-    if (!OK[o]) return [out.subarray(0, ol), 5];
-    const m = IM[o];
+    if (!valid(o)) return [out.subarray(0, ol), 5];
+    const m = imm(o);
     if (pc + m >= n) return [out.subarray(0, ol), 9];
     st++;
     const nx = pc + 1 + m;
-    if (sp < PO[o]) return [out.subarray(0, ol), 2];
-    if (sp - PO[o] + PU[o] > 256) return [out.subarray(0, ol), 3];
+    const po = pops(o), pu = pushes(o);
+    if (sp < po) return [out.subarray(0, ol), 2];
+    if (sp - po + pu > 256) return [out.subarray(0, ol), 3];
     pc = nx;
     switch (o) {
       case 0x00: return [out.subarray(0, ol), 0];
@@ -77,9 +65,14 @@ function run(p, inp) {
         sp -= 2; M[a] = v; break;
       }
       case 0x50: {
-        const b = enc.encode(String(D[sp - 1]));
-        if (ol + b.length > 65536) return [out.subarray(0, ol), 11];
-        sp--; out.set(b, ol); ol += b.length; break;
+        // PRINT: decimal without allocating (itoa into scratch, one copy).
+        const v = D[sp - 1];
+        let u = v < 0 ? -v : v, k = 12;
+        if (u === 0) tmp[--k] = 48;
+        while (u > 0) { tmp[--k] = 48 + (u % 10); u = (u / 10) | 0; }
+        if (v < 0) tmp[--k] = 45;
+        if (ol + (12 - k) > 65536) return [out.subarray(0, ol), 11];
+        sp--; out.set(tmp.subarray(k), ol); ol += 12 - k; break;
       }
       case 0x51:
         if (ol + 1 > 65536) return [out.subarray(0, ol), 11];
